@@ -1,0 +1,244 @@
+# 使用Spring WebFlux实现支持附件的邮件发送接口
+
+下面我将提供一个完整的解决方案，使用Spring WebFlux实现支持附件发送的邮件接口。
+
+## 实现思路
+
+1. 使用Spring WebFlux处理HTTP请求（包括文件上传）
+2. 集成Spring Mail发送功能
+3. 处理多部分表单数据（包括附件）
+4. 提供反应式和非阻塞的邮件发送体验
+
+## 实现步骤
+
+### 1. 添加Maven依赖
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webflux</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-mail</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+</dependencies>
+```
+
+### 2. 配置邮件属性
+
+在`application.yml`中添加配置：
+
+```yaml
+spring:
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: your-email@gmail.com
+    password: your-app-password
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+```
+
+### 3. 创建邮件请求DTO
+
+```java
+public class EmailRequest {
+    @NotBlank(message = "收件人不能为空")
+    @Email(message = "收件人邮箱格式不正确")
+    private String to;
+    
+    private String cc;
+    private String bcc;
+    
+    @NotBlank(message = "邮件主题不能为空")
+    private String subject;
+    
+    @NotBlank(message = "邮件内容不能为空")
+    private String content;
+    
+    private boolean isHtml = false;
+    
+    // 省略getter和setter
+}
+```
+
+### 4. 创建邮件服务
+
+```java
+@Service
+public class EmailService {
+    
+    private final JavaMailSender mailSender;
+    
+    public EmailService(JavaMailSender mailSender) {
+        this.mailSender = mailSender;
+    }
+    
+    public Mono<Void> sendEmail(EmailRequest emailRequest, List<File> attachments) {
+        return Mono.fromRunnable(() -> {
+            try {
+                MimeMessage message = mailSender.createMimeMessage();
+                MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+                
+                helper.setTo(emailRequest.getTo().split(",\\s*"));
+                
+                if (StringUtils.hasText(emailRequest.getCc())) {
+                    helper.setCc(emailRequest.getCc().split(",\\s*"));
+                }
+                
+                if (StringUtils.hasText(emailRequest.getBcc())) {
+                    helper.setBcc(emailRequest.getBcc().split(",\\s*"));
+                }
+                
+                helper.setSubject(emailRequest.getSubject());
+                helper.setText(emailRequest.getContent(), emailRequest.isHtml());
+                
+                // 添加附件
+                for (File file : attachments) {
+                    helper.addAttachment(file.getName(), file);
+                }
+                
+                mailSender.send(message);
+                
+                // 发送完成后删除临时文件
+                for (File file : attachments) {
+                    file.delete();
+                }
+            } catch (MessagingException e) {
+                throw new RuntimeException("邮件发送失败", e);
+            }
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+```
+
+### 5. 创建控制器
+
+```java
+@RestController
+@RequestMapping("/api/email")
+@Validated
+public class EmailController {
+    
+    private final EmailService emailService;
+    
+    public EmailController(EmailService emailService) {
+        this.emailService = emailService;
+    }
+    
+    @PostMapping(value = "/send", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public Mono<ResponseEntity<ApiResponse>> sendEmail(
+            @Valid @RequestPart EmailRequest emailRequest,
+            @RequestPart(required = false) List<FilePart> attachments) {
+        
+        if (attachments == null || attachments.isEmpty()) {
+            return emailService.sendEmail(emailRequest, Collections.emptyList())
+                    .then(Mono.just(ResponseEntity.ok(
+                            new ApiResponse(true, "邮件发送成功"))))
+                    .onErrorResume(e -> Mono.just(ResponseEntity.badRequest()
+                            .body(new ApiResponse(false, "邮件发送失败: " + e.getMessage()))));
+        }
+        
+        // 将FilePart保存为临时文件
+        return Flux.fromIterable(attachments)
+                .flatMap(this::saveFilePartAsTempFile)
+                .collectList()
+                .flatMap(tempFiles -> emailService.sendEmail(emailRequest, tempFiles)
+                        .then(Mono.just(ResponseEntity.ok(
+                                new ApiResponse(true, "邮件发送成功")))))
+                .onErrorResume(e -> Mono.just(ResponseEntity.badRequest()
+                        .body(new ApiResponse(false, "邮件发送失败: " + e.getMessage()))));
+    }
+    
+    private Mono<File> saveFilePartAsTempFile(FilePart filePart) {
+        try {
+            Path tempDir = Paths.get(System.getProperty("java.io.tmpdir"));
+            Path tempFile = Files.createTempFile(tempDir, "email_attachment_", 
+                    "_" + filePart.filename());
+            
+            return filePart.transferTo(tempFile)
+                    .then(Mono.just(tempFile.toFile()));
+        } catch (IOException e) {
+            return Mono.error(new RuntimeException("创建临时文件失败", e));
+        }
+    }
+    
+    // 响应对象
+    public static class ApiResponse {
+        private boolean success;
+        private String message;
+        
+        // 省略构造函数和getter/setter
+    }
+}
+```
+
+### 6. 全局异常处理
+
+```java
+@ControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public Mono<ResponseEntity<EmailController.ApiResponse>> handleValidationException(
+            MethodArgumentNotValidException ex) {
+        String errorMessage = ex.getBindingResult().getFieldErrors().stream()
+                .map(FieldError::getDefaultMessage)
+                .collect(Collectors.joining(", "));
+        
+        return Mono.just(ResponseEntity.badRequest()
+                .body(new EmailController.ApiResponse(false, errorMessage)));
+    }
+    
+    @ExceptionHandler(Exception.class)
+    public Mono<ResponseEntity<EmailController.ApiResponse>> handleGeneralException(Exception ex) {
+        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new EmailController.ApiResponse(false, "服务器内部错误: " + ex.getMessage())));
+    }
+}
+```
+
+## 使用示例
+
+### 发送带附件的邮件
+
+使用curl命令测试：
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/email/send \
+  -H "Content-Type: multipart/form-data" \
+  -F "emailRequest={\"to\": \"recipient@example.com\", \"subject\": \"测试邮件\", \"content\": \"这是一封测试邮件\", \"isHtml\": false};type=application/json" \
+  -F "attachments=@/path/to/file1.pdf" \
+  -F "attachments=@/path/to/file2.jpg"
+```
+
+### 使用HTML内容发送邮件
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/email/send \
+  -H "Content-Type: multipart/form-data" \
+  -F "emailRequest={\"to\": \"recipient@example.com\", \"subject\": \"HTML邮件\", \"content\": \"<h1>标题</h1><p>这是一封HTML邮件</p>\", \"isHtml\": true};type=application/json" \
+  -F "attachments=@/path/to/file.pdf"
+```
+
+## 注意事项
+
+1. **安全性**：在生产环境中，应该添加适当的身份验证和授权机制
+2. **文件大小限制**：可能需要配置Spring WebFlux的文件上传大小限制
+3. **错误处理**：完善各种异常情况的处理
+4. **日志记录**：添加适当的日志记录，便于调试和监控
+5. **性能考虑**：对于大文件，考虑使用流式处理而不是创建临时文件
+
+这个实现提供了基本的带附件邮件发送功能，可以根据实际需求进行扩展和优化。
